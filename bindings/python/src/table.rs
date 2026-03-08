@@ -1910,6 +1910,8 @@ pub struct LogScanner {
     projected_row_type: fcore::metadata::RowType,
     /// Cache for partition_id -> partition_name mapping (avoids repeated list_partition_infos calls)
     partition_name_cache: std::sync::RwLock<Option<HashMap<i64, String>>>,
+    iter_buffer: std::sync::Mutex<std::collections::VecDeque<Py<PyAny>>>,
+    iter_poll_timeout_ms: std::sync::atomic::AtomicU64,
 }
 
 #[pymethods]
@@ -2199,6 +2201,75 @@ impl LogScanner {
         Ok(df)
     }
 
+    fn set_iter_poll_timeout(slf: Py<Self>, timeout_ms: u64) -> Py<Self> {
+        Python::attach(|py| {
+            let this = slf.borrow(py);
+            this.iter_poll_timeout_ms
+                .store(timeout_ms, std::sync::atomic::Ordering::Relaxed);
+        });
+        slf
+    }
+
+    fn __aiter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __anext__(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        {
+            let mut buf = self.iter_buffer.lock().unwrap();
+            if let Some(item) = buf.pop_front() {
+                return Ok(Some(item));
+            }
+        }
+
+        let timeout_ms = self
+            .iter_poll_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let timeout = Duration::from_millis(timeout_ms);
+
+        loop {
+            match &self.scanner {
+                ScannerKind::Record(scanner) => {
+                    let scan_records = py
+                        .detach(|| {
+                            TOKIO_RUNTIME.block_on(async { scanner.poll(timeout).await })
+                        })
+                        .map_err(|e| FlussError::from_core_error(&e))?;
+
+                    let row_type = &self.projected_row_type;
+                    let mut buf = self.iter_buffer.lock().unwrap();
+
+                    for (_bucket, records) in scan_records.into_records_by_buckets() {
+                        for record in &records {
+                            let scan_record = ScanRecord::from_core(py, record, row_type)?;
+                            buf.push_back(Py::new(py, scan_record)?.into_any());
+                        }
+                    }
+
+                    if let Some(item) = buf.pop_front() {
+                        return Ok(Some(item));
+                    }
+                }
+                ScannerKind::Batch(scanner) => {
+                    let scan_batches = py
+                        .detach(|| {
+                            TOKIO_RUNTIME.block_on(async { scanner.poll(timeout).await })
+                        })
+                        .map_err(|e| FlussError::from_core_error(&e))?;
+
+                    if !scan_batches.is_empty() {
+                        let mut buf = self.iter_buffer.lock().unwrap();
+                        for batch in scan_batches {
+                            let rb = RecordBatch::from_scan_batch(batch);
+                            buf.push_back(Py::new(py, rb)?.into_any());
+                        }
+                        return Ok(Some(buf.pop_front().unwrap()));
+                    }
+                }
+            }
+        }
+    }
+
     fn __repr__(&self) -> String {
         format!("LogScanner(table={})", self.table_info.table_path)
     }
@@ -2219,6 +2290,8 @@ impl LogScanner {
             projected_schema,
             projected_row_type,
             partition_name_cache: std::sync::RwLock::new(None),
+            iter_buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            iter_poll_timeout_ms: std::sync::atomic::AtomicU64::new(1000),
         }
     }
 
